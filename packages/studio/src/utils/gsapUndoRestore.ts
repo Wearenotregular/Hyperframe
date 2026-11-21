@@ -9,8 +9,16 @@ import {
   findGsapScriptElements,
   readNestedFiles,
   repaintDroppedTweenStyle,
+  sealedRerun,
   timelineKeys,
 } from "./gsapSoftReload";
+import {
+  SAVED_STATE_DEADLINE_MS,
+  confirmPreviewRerun,
+  takePreviewTicket,
+  ticketLoadLive,
+  type PreviewWrite,
+} from "./sealedPreviewLedger";
 import { ensureHfIds, isCompositionTemplate } from "@hyperframes/parsers/hf-ids";
 import { templateContent } from "@hyperframes/parsers/sub-composition-validity";
 import { findAuthoredElement, parseSavedSource } from "./authoredSource";
@@ -409,7 +417,17 @@ function sealedRestore(activeDocPath: string, files: RestoreFiles): SealedRestor
   return restore;
 }
 
-/** Sends the restore to a sealed preview; a refusal, or no answer, reloads it. */
+function withRerun(
+  restore: SealedRestore,
+  active: UndoRestoreFile | undefined,
+  script: string | null,
+): SealedRestore {
+  if (!restore.scripted || !active || !script) return restore;
+  const files = { authoredHtml: active.restored, previousHtml: active.previous };
+  return { ...restore, rerun: sealedRerun(script, files) };
+}
+
+/** Sends the restore to a sealed preview, with the script re-run an element GSAP parsed needs; a refusal reloads. */
 function applySealedRestore(
   iframe: HTMLIFrameElement,
   activeDocPath: string,
@@ -417,6 +435,7 @@ function applySealedRestore(
   currentTime: number,
   reloadPreview: () => void,
   onShownInPlace?: () => void,
+  version?: number,
 ): "soft" | "full" {
   const restore = sealedRestore(activeDocPath, files);
   const active = files[activeDocPath];
@@ -431,27 +450,63 @@ function applySealedRestore(
         authoredHtml: active.restored,
         previousHtml: active.previous,
         restore: restore.scopes,
+        version,
       });
     if (rerun === "applied") return "soft";
   } else if (restore?.scopes.length) {
-    sendSealedRestore(iframe, restore, currentTime, reloadPreview, onShownInPlace);
+    const sent = withRerun(restore, active, script);
+    const snapshot = restoredSnapshot(sent, active, version);
+    sendSealedRestore(
+      iframe,
+      { sent, snapshot, version },
+      currentTime,
+      reloadPreview,
+      onShownInPlace,
+    );
     return "soft";
   }
   reloadPreview();
   return "full";
 }
 
+/** The restored file as a complete snapshot, when the restore re-runs its script. */
+function restoredSnapshot(
+  { rerun }: SealedRestore,
+  active: RestoreFiles[string] | undefined,
+  version: number | undefined,
+): PreviewWrite | null {
+  if (!rerun || !active) return null;
+  const { restored: authoredHtml, previous: previousHtml } = active;
+  return { scriptText: rerun.script, authoredHtml, previousHtml, version };
+}
+
 function sendSealedRestore(
   iframe: HTMLIFrameElement,
-  restore: SealedRestore,
+  {
+    sent: restore,
+    snapshot,
+    version,
+  }: { sent: SealedRestore; snapshot: PreviewWrite | null; version?: number },
   currentTime: number,
   reloadPreview: () => void,
   onShownInPlace?: () => void,
 ): void {
-  void previewRequest(iframe, "restore-attributes", { ...restore, time: currentTime }).then(
+  const scriptText = restore.rerun?.script ?? "";
+  const ticket = takePreviewTicket(iframe, {
+    scriptText,
+    snapshot,
+    attributes: true,
+    timing: false,
+    version,
+  });
+  const params = { ...restore, time: currentTime };
+  void previewRequest(iframe, "restore-attributes", params, SAVED_STATE_DEADLINE_MS).then(
     (reply) => {
-      if (!reply?.applied) reloadPreview();
-      else onShownInPlace?.();
+      if (!ticketLoadLive(ticket)) return;
+      // Refused: its attributes are not on screen, and a newer re-run does not set them.
+      if (!reply?.applied) return reloadPreview();
+      if (reply.reran === true) confirmPreviewRerun(ticket);
+      onShownInPlace?.();
     },
   );
 }
@@ -491,6 +546,7 @@ export function applyUndoRestoreToPreview(
   currentTime: number,
   reload: () => void,
   nestedFiles?: Map<string, string> | null,
+  version?: number,
 ): "soft" | "full" {
   // The master view carries a NULL activeCompPath but the root iframe shows
   // index.html — the codebase-wide convention (`activeCompPath || "index.html"`).
@@ -503,8 +559,14 @@ export function applyUndoRestoreToPreview(
     reload();
   };
   if (iframe && files && previewFrameOpaque(iframe))
-    return applySealedRestore(iframe, activeDocPath, files, currentTime, reloadPreview, () =>
-      announcePreviewRestoredInPlace(iframe),
+    return applySealedRestore(
+      iframe,
+      activeDocPath,
+      files,
+      currentTime,
+      reloadPreview,
+      () => announcePreviewRestoredInPlace(iframe),
+      version,
     );
   const doc = iframe?.contentDocument;
   const win = iframe?.contentWindow as PreviewWindow | null;
